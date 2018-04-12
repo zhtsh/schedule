@@ -178,6 +178,7 @@ class Job(object):
         self.last_run = None  # datetime of the last run
         self.next_run = None  # datetime of the next run
         self.period = None  # timedelta between runs, only valid for
+        self.day_of_month = None
         self.start_day = None  # Specific day of the week to start on
         self.tags = set()  # unique set of tags for the job
         self.scheduler = scheduler  # scheduler to register with
@@ -206,10 +207,16 @@ class Job(object):
         call_repr = job_func_name + '(' + ', '.join(args + kwargs) + ')'
 
         if self.at_time is not None:
-            return 'Every %s %s at %s do %s %s' % (
-                   self.interval,
-                   self.unit[:-1] if self.interval == 1 else self.unit,
-                   self.at_time, call_repr, timestats)
+            if self.unit == 'months':
+                return 'Every %s %s at day %s %s do %s %s' % (
+                    self.interval,
+                    self.unit[:-1] if self.interval == 1 else self.unit,
+                    self.day_of_month, self.at_time, call_repr, timestats)
+            else:
+                return 'Every %s %s at %s do %s %s' % (
+                       self.interval,
+                       self.unit[:-1] if self.interval == 1 else self.unit,
+                       self.at_time, call_repr, timestats)
         else:
             fmt = (
                 'Every %(interval)s ' +
@@ -317,6 +324,12 @@ class Job(object):
         self.start_day = 'sunday'
         return self.weeks
 
+    @property
+    def month(self):
+        assert self.interval == 1, 'Only suport every one month'
+        self.unit = 'months'
+        return self
+
     def tag(self, *tags):
         """
         Tags the job with one or more unique indentifiers.
@@ -341,16 +354,24 @@ class Job(object):
         :param time_str: A string in `XX:YY` format.
         :return: The invoked job instance
         """
-        assert self.unit in ('days', 'hours') or self.start_day
-        hour, minute = time_str.split(':')
-        minute = int(minute)
-        if self.unit == 'days' or self.start_day:
-            hour = int(hour)
-            assert 0 <= hour <= 23
-        elif self.unit == 'hours':
-            hour = 0
-        assert 0 <= minute <= 59
-        self.at_time = datetime.time(hour, minute)
+        assert self.unit in ('months', 'days', 'hours') or self.start_day
+        if self.unit == 'months':
+            day_of_month, hour_minute = time_str.split(' ')
+            self.day_of_month = int(day_of_month)
+            if self.day_of_month > 28:
+                self.day_of_month = 28
+            hour, minute = hour_minute.split(':')
+            self.at_time = datetime.time(int(hour), int(minute))
+        else:
+            hour, minute = time_str.split(':')
+            minute = int(minute)
+            if self.unit == 'days' or self.start_day:
+                hour = int(hour)
+                assert 0 <= hour <= 23
+            elif self.unit == 'hours':
+                hour = 0
+            assert 0 <= minute <= 59
+            self.at_time = datetime.time(hour, minute)
         return self
 
     def to(self, latest):
@@ -414,56 +435,71 @@ class Job(object):
         """
         Compute the instant when this job should run next.
         """
-        assert self.unit in ('seconds', 'minutes', 'hours', 'days', 'weeks')
+        assert self.unit in ('seconds', 'minutes', 'hours', 'days', 'weeks', 'months')
 
-        if self.latest is not None:
-            assert self.latest >= self.interval
-            interval = random.randint(self.interval, self.latest)
+        if self.unit == 'months':
+            now_dt = datetime.datetime.now()
+            now_month_dt = datetime.datetime(now_dt.year, now_dt.month, self.day_of_month,
+                            self.at_time.hour, self.at_time.minute, self.at_time.second)
+            if now_dt <= now_month_dt:
+                self.next_run = now_month_dt
+            else:
+                year = now_dt.year
+                next_month = now_dt.month + 1
+                if now_dt.month == 13:
+                    year += 1
+                    next_month = 1
+                self.next_run = datetime.datetime(year, next_month, self.day_of_month,
+                                    self.at_time.hour, self.at_time.minute, self.at_time.second)
         else:
-            interval = self.interval
+            if self.latest is not None:
+                assert self.latest >= self.interval
+                interval = random.randint(self.interval, self.latest)
+            else:
+                interval = self.interval
 
-        self.period = datetime.timedelta(**{self.unit: interval})
-        self.next_run = datetime.datetime.now() + self.period
-        if self.start_day is not None:
-            assert self.unit == 'weeks'
-            weekdays = (
-                'monday',
-                'tuesday',
-                'wednesday',
-                'thursday',
-                'friday',
-                'saturday',
-                'sunday'
-            )
-            assert self.start_day in weekdays
-            weekday = weekdays.index(self.start_day)
-            days_ahead = weekday - self.next_run.weekday()
-            if days_ahead <= 0:  # Target day already happened this week
-                days_ahead += 7
-            self.next_run += datetime.timedelta(days_ahead) - self.period
-        if self.at_time is not None:
-            assert self.unit in ('days', 'hours') or self.start_day is not None
-            kwargs = {
-                'minute': self.at_time.minute,
-                'second': self.at_time.second,
-                'microsecond': 0
-            }
-            if self.unit == 'days' or self.start_day is not None:
-                kwargs['hour'] = self.at_time.hour
-            self.next_run = self.next_run.replace(**kwargs)
-            # If we are running for the first time, make sure we run
-            # at the specified time *today* (or *this hour*) as well
-            if not self.last_run:
-                now = datetime.datetime.now()
-                if (self.unit == 'days' and self.at_time > now.time() and
-                        self.interval == 1):
-                    self.next_run = self.next_run - datetime.timedelta(days=1)
-                elif self.unit == 'hours' and self.at_time.minute > now.minute:
-                    self.next_run = self.next_run - datetime.timedelta(hours=1)
-        if self.start_day is not None and self.at_time is not None:
-            # Let's see if we will still make that time we specified today
-            if (self.next_run - datetime.datetime.now()).days >= 7:
-                self.next_run -= self.period
+            self.period = datetime.timedelta(**{self.unit: interval})
+            self.next_run = datetime.datetime.now() + self.period
+            if self.start_day is not None:
+                assert self.unit == 'weeks'
+                weekdays = (
+                    'monday',
+                    'tuesday',
+                    'wednesday',
+                    'thursday',
+                    'friday',
+                    'saturday',
+                    'sunday'
+                )
+                assert self.start_day in weekdays
+                weekday = weekdays.index(self.start_day)
+                days_ahead = weekday - self.next_run.weekday()
+                if days_ahead <= 0:  # Target day already happened this week
+                    days_ahead += 7
+                self.next_run += datetime.timedelta(days_ahead) - self.period
+            if self.at_time is not None:
+                assert self.unit in ('days', 'hours') or self.start_day is not None
+                kwargs = {
+                    'minute': self.at_time.minute,
+                    'second': self.at_time.second,
+                    'microsecond': 0
+                }
+                if self.unit == 'days' or self.start_day is not None:
+                    kwargs['hour'] = self.at_time.hour
+                self.next_run = self.next_run.replace(**kwargs)
+                # If we are running for the first time, make sure we run
+                # at the specified time *today* (or *this hour*) as well
+                if not self.last_run:
+                    now = datetime.datetime.now()
+                    if (self.unit == 'days' and self.at_time > now.time() and
+                            self.interval == 1):
+                        self.next_run = self.next_run - datetime.timedelta(days=1)
+                    elif self.unit == 'hours' and self.at_time.minute > now.minute:
+                        self.next_run = self.next_run - datetime.timedelta(hours=1)
+            if self.start_day is not None and self.at_time is not None:
+                # Let's see if we will still make that time we specified today
+                if (self.next_run - datetime.datetime.now()).days >= 7:
+                    self.next_run -= self.period
 
 
 # The following methods are shortcuts for not having to
