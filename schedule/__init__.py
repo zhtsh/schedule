@@ -446,7 +446,7 @@ class Job(object):
             else:
                 year = now_dt.year
                 next_month = now_dt.month + 1
-                if now_dt.month == 13:
+                if next_month == 13:
                     year += 1
                     next_month = 1
                 self.next_run = datetime.datetime(year, next_month, self.day_of_month,
